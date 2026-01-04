@@ -1,0 +1,191 @@
+import requests
+import json
+import time
+from datetime import datetime
+import pandas as pd
+from typing import Dict, List
+
+class TicketMonitor:
+    def __init__(self):
+        self.session = requests.Session()
+        # 设置合法请求头
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://kyfw.12306.cn/otn/leftTicket/init',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+        }
+        self.session.headers.update(self.headers)
+        
+    def get_station_code(self, station_name: str) -> str:
+        """获取车站代码（需要定期更新车站列表）"""
+        # 12306车站列表接口（可能需要更新）
+        url = "https://kyfw.12306.cn/otn/resources/js/framework/station_name.js"
+        try:
+            response = self.session.get(url, timeout=10)
+            stations = {}
+            # 解析车站数据（格式：@bjb|北京北|VAP|...）
+            for line in response.text.split('@')[1:]:
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    stations[parts[1]] = parts[2]  # 中文名: 代码
+            return stations.get(station_name, "")
+        except Exception as e:
+            print(f"获取车站代码失败: {e}")
+            return ""
+    
+    def query_tickets(self, from_station: str, to_station: str, date: str) -> List[Dict]:
+        """
+        查询车票信息
+        :param from_station: 出发站中文名
+        :param to_station: 到达站中文名
+        :param date: 日期，格式：2026-01-01
+        :return: 车票信息列表
+        """
+        # 获取车站代码
+        from_code = self.get_station_code(from_station)
+        to_code = self.get_station_code(to_station)
+        
+        if not from_code or not to_code:
+            print("车站代码获取失败，请检查车站名称")
+            return []
+        
+        # 12306查询接口
+        url = "https://kyfw.12306.cn/otn/leftTicket/query"
+        params = {
+            'leftTicketDTO.train_date': date,
+            'leftTicketDTO.from_station': from_code,
+            'leftTicketDTO.to_station': to_code,
+            'purpose_codes': 'ADULT'  # 成人票
+        }
+        
+        try:
+            response = self.session.get(url, params=params, timeout=10)
+            data = response.json()
+            
+            if data.get('status') and data.get('data'):
+                return self.parse_ticket_data(data['data']['result'], from_station, to_station)
+            else:
+                print(f"查询失败: {data.get('messages', ['未知错误'])}")
+                return []
+                
+        except Exception as e:
+            print(f"查询异常: {e}")
+            return []
+    
+    def parse_ticket_data(self, raw_data: List[str], from_station: str, to_station: str) -> List[Dict]:
+        """解析车票数据"""
+        tickets = []
+        
+        for item in raw_data:
+            fields = item.split('|')
+            if len(fields) < 30:
+                continue
+                
+            try:
+                ticket_info = {
+                    '查询时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    '车次': fields[3],
+                    '出发站': from_station,
+                    '到达站': to_station,
+                    '出发时间': fields[8],
+                    '到达时间': fields[9],
+                    '历时': fields[10],
+                    '商务座/特等座': fields[32] or '--',  # 可能为空
+                    '一等座': fields[31] or '--',
+                    '二等座': fields[30] or '--',
+                    '高级软卧': fields[21] or '--',
+                    '软卧': fields[23] or '--',
+                    '动卧': fields[33] or '--',
+                    '硬卧': fields[28] or '--',
+                    '软座': fields[24] or '--',
+                    '硬座': fields[29] or '--',
+                    '无座': fields[26] or '--',
+                    '其他': fields[22] or '--',
+                    '备注': fields[1] if len(fields) > 1 else ''
+                }
+                tickets.append(ticket_info)
+            except IndexError as e:
+                print(f"数据解析错误: {e}")
+                continue
+                
+        return tickets
+    
+    def save_to_csv(self, tickets: List[Dict], filename: str = "ticket_monitor.csv"):
+        """保存数据到CSV文件"""
+        if not tickets:
+            return
+        
+        df = pd.DataFrame(tickets)
+        # 如果文件存在，追加数据
+        try:
+            existing_df = pd.read_csv(filename)
+            df = pd.concat([existing_df, df], ignore_index=True)
+        except FileNotFoundError:
+            pass
+        
+        df.to_csv(filename, index=False, encoding='utf-8-sig')
+        print(f"数据已保存到 {filename}")
+    
+    def monitor_price_change(self, from_station: str, to_station: str, date: str, 
+                           interval_minutes: int = 5, max_times: int = 10):
+        """
+        监控票价变化
+        :param interval_minutes: 监控间隔（分钟）
+        :param max_times: 最大监控次数
+        """
+        print(f"开始监控 {from_station} → {to_station} 的票价变化")
+        print(f"监控日期: {date}, 间隔: {interval_minutes}分钟")
+        print("=" * 60)
+        
+        previous_tickets = {}
+        
+        for i in range(max_times):
+            print(f"\n第 {i+1} 次查询 ({datetime.now().strftime('%H:%M:%S')})")
+            
+            tickets = self.query_tickets(from_station, to_station, date)
+            
+            if tickets:
+                # 保存数据
+                self.save_to_csv(tickets)
+                
+                # 简单对比：显示有余票的车次
+                available_trains = []
+                for ticket in tickets:
+                    # 检查二等座是否有票
+                    if ticket['二等座'] and ticket['二等座'] not in ['--', '无']:
+                        available_trains.append(ticket['车次'])
+                
+                if available_trains:
+                    print(f"发现有余票的车次: {', '.join(available_trains)}")
+                else:
+                    print("暂无余票")
+                
+                # 显示前3个车次信息
+                for ticket in tickets[:3]:
+                    print(f"{ticket['车次']}: {ticket['出发时间']}→{ticket['到达时间']} "
+                          f"二等座: {ticket['二等座']}")
+            
+            # 等待下一次查询
+            if i < max_times - 1:
+                print(f"等待 {interval_minutes} 分钟后再次查询...")
+                time.sleep(interval_minutes * 60)
+
+# 使用示例
+if __name__ == "__main__":
+    monitor = TicketMonitor()
+    
+    # 设置监控参数（示例）
+    FROM = "北京"
+    TO = "上海"
+    DATE = "2026-01-15"  # 替换为目标日期
+    
+    # 开始监控（每10分钟查询一次，共查询5次）
+    monitor.monitor_price_change(
+        from_station=FROM,
+        to_station=TO,
+        date=DATE,
+        interval_minutes=10,  # 查询间隔，建议不少于5分钟
+        max_times=5  # 查询次数
+    )
